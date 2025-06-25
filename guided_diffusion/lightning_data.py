@@ -11,13 +11,15 @@ from .cell_datasets_loader import CellDataset, load_VAE
 class CellDataModule(pl.LightningDataModule):
     """Lightning DataModule for cell datasets."""
 
-    def __init__(self, data_dir, batch_size, vae_path=None, train_vae=False, hidden_dim=128):
+    def __init__(self, data_dir, batch_size, vae_path=None, train_vae=False, hidden_dim=128, use_controlnet=False, keep_ratio=0.5):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.vae_path = vae_path
         self.train_vae = train_vae
         self.hidden_dim = hidden_dim
+        self.use_controlnet = use_controlnet
+        self.keep_ratio = keep_ratio
 
     def setup(self, stage=None):
         adata = sc.read_h5ad(self.data_dir)
@@ -41,7 +43,12 @@ class CellDataModule(pl.LightningDataModule):
             cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
             cell_data = cell_data.cpu().detach().numpy()
 
-        self.dataset = CellDataset(cell_data, classes)
+        self.dataset = CellDataset(
+            cell_data,
+            classes,
+            use_controlnet=self.use_controlnet,
+            keep_ratio=self.keep_ratio,
+        )
 
     def train_dataloader(self):
         return DataLoader(
