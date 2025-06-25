@@ -107,11 +107,15 @@ class CellDataset(Dataset):
     def __init__(
         self,
         cell_data,
-        class_name
+        class_name,
+        use_controlnet=False,
+        keep_ratio=0.5,
     ):
         super().__init__()
         self.data = cell_data
         self.class_name = class_name
+        self.use_controlnet = use_controlnet
+        self.keep_ratio = keep_ratio
 
     def __len__(self):
         return self.data.shape[0]
@@ -121,5 +125,13 @@ class CellDataset(Dataset):
         out_dict = {}
         if self.class_name is not None:
             out_dict["y"] = np.array(self.class_name[idx], dtype=np.int64)
+        if self.use_controlnet:
+            control = np.full_like(arr, -1.0, dtype=np.float32)
+            nz = np.where(arr != 0)[0]
+            if len(nz) > 0:
+                mask = np.random.rand(len(nz)) < self.keep_ratio
+                keep_idx = nz[mask]
+                control[keep_idx] = arr[keep_idx]
+            out_dict["control"] = control
         return arr, out_dict
 
