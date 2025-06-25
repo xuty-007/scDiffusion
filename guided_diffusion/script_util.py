@@ -3,7 +3,7 @@ import inspect
 
 from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
-from .cell_model import Cell_classifier, Cell_Unet
+from .cell_model import Cell_classifier, Cell_Unet, ControlledCellUnet
 
 NUM_CLASSES = 11
 
@@ -93,6 +93,46 @@ def create_model(
         hidden_dim,
         dropout=dropout
     )
+
+
+
+def create_controlled_model(
+    input_dim,
+    hidden_dim,
+    dropout,
+):
+    return ControlledCellUnet(input_dim, hidden_dim, dropout)
+
+def create_controlled_model_and_diffusion(
+    input_dim,
+    hidden_dim,
+    class_cond,
+    learn_sigma,
+    diffusion_steps,
+    noise_schedule,
+    timestep_respacing,
+    use_kl,
+    predict_xstart,
+    rescale_timesteps,
+    rescale_learned_sigmas,
+    dropout,
+):
+    model = create_controlled_model(
+        input_dim,
+        hidden_dim,
+        dropout
+    )
+    diffusion = create_gaussian_diffusion(
+        steps=diffusion_steps,
+        learn_sigma=learn_sigma,
+        noise_schedule=noise_schedule,
+        use_kl=use_kl,
+        predict_xstart=predict_xstart,
+        rescale_timesteps=rescale_timesteps,
+        rescale_learned_sigmas=rescale_learned_sigmas,
+        timestep_respacing=timestep_respacing,
+    )
+    return model, diffusion
 
 
 def create_classifier_and_diffusion(

@@ -6,6 +6,7 @@ from .nn import (
     timestep_embedding,
 )
 
+from .controlnet import ControlNet
 class TimeEmbedding(nn.Module):  
     def __init__(self, hidden_dim):  
         super(TimeEmbedding, self).__init__()  
@@ -163,3 +164,19 @@ class Cell_classifier(nn.Module):
 
         x = self.out(x)
         return x
+
+class ControlledCellUnet(nn.Module):
+    """Cell_Unet with an optional ControlNet."""
+
+    def __init__(self, input_dim=2, hidden_num=None, dropout=0.1):
+        super().__init__()
+        if hidden_num is None:
+            hidden_num = [2000, 1000, 500, 500]
+        self.unet = Cell_Unet(input_dim, hidden_num, dropout)
+        self.control_net = ControlNet(input_dim, hidden_num, dropout)
+
+    def forward(self, x_input, t, control=None):
+        if control is not None:
+            ctrl_out = self.control_net(control, t)
+            x_input = x_input + ctrl_out
+        return self.unet(x_input, t)
