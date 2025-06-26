@@ -22,6 +22,7 @@ from guided_diffusion.resample import create_named_schedule_sampler
 from guided_diffusion.script_util import (
     model_and_diffusion_defaults,
     create_model_and_diffusion,
+    create_controlled_model_and_diffusion,
     args_to_dict,
     add_dict_to_argparser,
 )
@@ -34,9 +35,14 @@ def main():
     seed_everything(1234)
     args = create_argparser().parse_args()
 
-    model, diffusion = create_model_and_diffusion(
-        **args_to_dict(args, model_and_diffusion_defaults().keys())
-    )
+    if args.use_controlnet:
+        model, diffusion = create_controlled_model_and_diffusion(
+            **args_to_dict(args, model_and_diffusion_defaults().keys())
+        )
+    else:
+        model, diffusion = create_model_and_diffusion(
+            **args_to_dict(args, model_and_diffusion_defaults().keys())
+        )
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
     lit_model = DiffusionLitModule(
@@ -53,6 +59,8 @@ def main():
         batch_size=args.batch_size,
         vae_path=args.vae_path,
         train_vae=False,
+        use_controlnet=args.use_controlnet,
+        keep_ratio=args.keep_ratio,
     )
 
     period_checkpoint = ModelCheckpoint(
@@ -108,6 +116,8 @@ def create_argparser():
         use_fp16=False,
         fp16_scale_growth=1e-3,
         vae_path="output/Autoencoder_checkpoint/muris_AE/model_seed=0_step=0.pt",
+        use_controlnet=False,
+        keep_ratio=0.5,
         model_name="muris_diffusion",
         save_dir="output/diffusion_checkpoint",
     )
