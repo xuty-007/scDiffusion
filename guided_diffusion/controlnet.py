@@ -12,7 +12,7 @@ class ControlNet(nn.Module):
         super().__init__()
         if hidden_num is None:
             hidden_num = [2000, 1000, 500, 500]
-        self.control_unet = Cell_Unet(input_dim, hidden_num, dropout)
+        self.control_unet = Cell_Unet(input_dim, hidden_num, dropout, cond_dim=0)
         # Start from zero weights so control net does not affect inference if not trained
         zero_module(self.control_unet)
 

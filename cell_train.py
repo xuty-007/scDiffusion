@@ -52,6 +52,9 @@ def main():
         weight_decay=args.weight_decay,
         schedule_sampler=schedule_sampler,
         lr_anneal_steps=args.lr_anneal_steps,
+        vae_path=args.vae_path,
+        train_vae=False,
+        hidden_dim=128,
     )
 
     data_module = CellDataModule(
