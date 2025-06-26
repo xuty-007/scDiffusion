@@ -1,12 +1,14 @@
 import torch
 import torch.nn as nn
 
+
 from .nn import (
     linear,
     timestep_embedding,
 )
 
 from .controlnet import ControlNet
+
 class TimeEmbedding(nn.Module):  
     def __init__(self, hidden_dim):  
         super(TimeEmbedding, self).__init__()  
@@ -20,47 +22,70 @@ class TimeEmbedding(nn.Module):
     def forward(self, t):  
         return self.time_embed(timestep_embedding(t, self.hidden_dim).squeeze(1))  
 
-class ResidualBlock(nn.Module):  
-    def __init__(self, in_features, out_features, time_features):  
-        super(ResidualBlock, self).__init__()  
-        self.fc = nn.Linear(in_features, out_features)  
-        self.norm = nn.LayerNorm(out_features) 
+class AdaLayerNorm(nn.Module):
+    def __init__(self, feat_dim, cond_dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(feat_dim)
+        self.scale = nn.Linear(cond_dim, feat_dim)
+        self.shift = nn.Linear(cond_dim, feat_dim)
+
+    def forward(self, x, cond=None):
+        x = self.norm(x)
+        if cond is not None:
+            scale = self.scale(cond)
+            shift = self.shift(cond)
+            x = x * (1 + scale) + shift
+        return x
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features, out_features, time_features, cond_dim=0):
+        super(ResidualBlock, self).__init__()
+        self.fc = nn.Linear(in_features, out_features)
+        if cond_dim > 0:
+            self.norm = AdaLayerNorm(out_features, cond_dim)
+        else:
+            self.norm = nn.LayerNorm(out_features)
         self.emb_layer = nn.Sequential(
             nn.SiLU(),
             linear(
                 time_features,
                 out_features,
             ),
-        ) 
-        self.act = nn.SiLU()  
-        self.drop = nn.Dropout(0)  
+        )
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout(0)
+
+    def forward(self, x, emb, cond=None):
+        h = self.fc(x)
+        h = h + self.emb_layer(emb)
+        if isinstance(self.norm, AdaLayerNorm):
+            h = self.norm(h, cond)
+        else:
+            h = self.norm(h)
+        h = self.act(h)
+        h = self.drop(h)
+        return h
   
-    def forward(self, x, emb):  
-        h = self.fc(x)  
-        h = h + self.emb_layer(emb)  
-        h = self.norm(h)  
-        h = self.act(h)  
-        h = self.drop(h)  
-        return h  
-  
-class Cell_Unet(nn.Module):  
-    def __init__(self, input_dim=2, hidden_num=[2000,1000,500,500], dropout=0.1):  
-        super(Cell_Unet, self).__init__()  
-        self.hidden_num = hidden_num  
+class Cell_Unet(nn.Module):
+    def __init__(self, input_dim=2, hidden_num=[2000,1000,500,500], dropout=0.1, cond_dim=0):
+        super(Cell_Unet, self).__init__()
+        self.hidden_num = hidden_num
+        self.cond_dim = cond_dim
   
         self.time_embedding = TimeEmbedding(hidden_num[0])  
   
         # Create layers dynamically  
-        self.layers = nn.ModuleList()  
+        self.layers = nn.ModuleList()
 
-        self.layers.append(ResidualBlock(input_dim, hidden_num[0], hidden_num[0]))
+        self.layers.append(ResidualBlock(input_dim, hidden_num[0], hidden_num[0], cond_dim))
 
-        for i in range(len(hidden_num)-1):  
-            self.layers.append(ResidualBlock(hidden_num[i], hidden_num[i+1], hidden_num[0]))  
+        for i in range(len(hidden_num)-1):
+            self.layers.append(ResidualBlock(hidden_num[i], hidden_num[i+1], hidden_num[0], cond_dim))
   
         self.reverse_layers = nn.ModuleList()  
-        for i in reversed(range(len(hidden_num)-1)):  
-            self.reverse_layers.append(ResidualBlock(hidden_num[i+1], hidden_num[i], hidden_num[0]))  
+        for i in reversed(range(len(hidden_num)-1)):
+            self.reverse_layers.append(ResidualBlock(hidden_num[i+1], hidden_num[i], hidden_num[0], cond_dim))
   
         self.out1 = nn.Linear(hidden_num[0], int(hidden_num[1]*2))  
         self.norm_out = nn.LayerNorm(int(hidden_num[1]*2))
@@ -69,21 +94,22 @@ class Cell_Unet(nn.Module):
         self.act = nn.SiLU()  
         self.drop = nn.Dropout(dropout)  
   
-    def forward(self, x_input, t, y=None):  
-        emb = self.time_embedding(t)  
-        x = x_input.float()  
+    def forward(self, x_input, t, cond_emb=None):
+
+        emb = self.time_embedding(t)
+        x = x_input.float()
   
         # Forward pass with history saving  
         history = []  
-        for layer in self.layers:  
-            x = layer(x, emb)  
+        for layer in self.layers:
+            x = layer(x, emb, cond_emb)
             history.append(x)  
         
         history.pop()
   
         # Reverse pass with skip connections  
-        for layer in self.reverse_layers:  
-            x = layer(x, emb)  
+        for layer in self.reverse_layers:
+            x = layer(x, emb, cond_emb)
             x = x + history.pop()  # Skip connection  
   
         x = self.out1(x)  
@@ -168,15 +194,15 @@ class Cell_classifier(nn.Module):
 class ControlledCellUnet(nn.Module):
     """Cell_Unet with an optional ControlNet."""
 
-    def __init__(self, input_dim=2, hidden_num=None, dropout=0.1):
+    def __init__(self, input_dim=2, hidden_num=None, dropout=0.1, cond_dim=0):
         super().__init__()
         if hidden_num is None:
             hidden_num = [2000, 1000, 500, 500]
-        self.unet = Cell_Unet(input_dim, hidden_num, dropout)
+        self.unet = Cell_Unet(input_dim, hidden_num, dropout, cond_dim)
         self.control_net = ControlNet(input_dim, hidden_num, dropout)
 
-    def forward(self, x_input, t, control=None):
+    def forward(self, x_input, t, control=None, cond_emb=None):
         if control is not None:
             ctrl_out = self.control_net(control, t)
             x_input = x_input + ctrl_out
-        return self.unet(x_input, t)
+        return self.unet(x_input, t, cond_emb)

@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from sklearn.preprocessing import LabelEncoder
 
-from .cell_datasets_loader import CellDataset, load_VAE
+from .cell_datasets_loader import CellDataset, PROMPT_TEMPLATE
 
 
 class CellDataModule(pl.LightningDataModule):
@@ -37,15 +37,32 @@ class CellDataModule(pl.LightningDataModule):
         sc.pp.log1p(adata)
         cell_data = adata.X.toarray()
 
-        if not self.train_vae:
-            num_gene = cell_data.shape[1]
-            autoencoder = load_VAE(self.vae_path, num_gene, self.hidden_dim)
-            cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
-            cell_data = cell_data.cpu().detach().numpy()
-
+        prompts = []
+        smiles = adata.obs["canonical_smiles"].tolist()
+        for _, row in adata.obs.iterrows():
+            prompt = PROMPT_TEMPLATE.format(
+                drug=row["drug"],
+                pubchem_cid=row["pubchem_cid"],
+                canonical_smiles=row["canonical_smiles"],
+                drug_concentration=row["drug concentration with unit"],
+                cell_line_id=row["cell_line_id"],
+                gene_count=row["gene_count"],
+                tscp_count=row["tscp_count"],
+                pcnt_mito=row["pcnt_mito"],
+                mread_count=row["mread_count"],
+                moa_broad=row["moa-broad"],
+                moa_fine=row["moa-fine"],
+                targets=row["targets"],
+                human_approved=row["human-approved"],
+                clinical_trials=row["clinical-trials"],
+                gpt_notes_approval=row["gpt-notes-approval"],
+            )
+            prompts.append(prompt)
         self.dataset = CellDataset(
             cell_data,
             classes,
+            prompts,
+            smiles,
             use_controlnet=self.use_controlnet,
             keep_ratio=self.keep_ratio,
         )

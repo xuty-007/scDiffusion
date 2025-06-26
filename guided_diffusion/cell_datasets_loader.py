@@ -13,6 +13,17 @@ sys.path.append('..')
 from VAE.VAE_model import VAE
 from sklearn.preprocessing import LabelEncoder
 
+
+PROMPT_TEMPLATE = (
+    "Drug name: {drug} (PubChem CID: {pubchem_cid}) has the canonical SMILES {canonical_smiles}. "
+    "The drug was tested at {drug_concentration} on the cell line {cell_line_id}. "
+    "Biological metrics include gene count of {gene_count:.2f}, transcript count of {tscp_count:.2f}, "
+    "mitochondrial read percentage of {pcnt_mito:.2%}, and mRNA read count of {mread_count:.2f}. "
+    "The mechanism of action (MOA) is broadly {moa_broad}, specifically {moa_fine}, and targets are currently {targets}. "
+    "Clinical status: approved by humans - {human_approved}, in clinical trials - {clinical_trials}. "
+    "Additional notes: {gpt_notes_approval}"
+)
+
 def stabilize(expression_matrix):
     ''' Use Anscombes approximation to variance stabilize Negative Binomial data
     See https://f1000research.com/posters/4-1041 for motivation.
@@ -80,16 +91,41 @@ def load_data(
 
     cell_data = adata.X.toarray()
 
+    # Prepare prompts and SMILES strings for later conditioning
+    prompts = []
+    smiles = adata.obs["canonical_smiles"].tolist()
+    for _, row in adata.obs.iterrows():
+        prompt = PROMPT_TEMPLATE.format(
+            drug=row["drug"],
+            pubchem_cid=row["pubchem_cid"],
+            canonical_smiles=row["canonical_smiles"],
+            drug_concentration=row["drug concentration with unit"],
+            cell_line_id=row["cell_line_id"],
+            gene_count=row["gene_count"],
+            tscp_count=row["tscp_count"],
+            pcnt_mito=row["pcnt_mito"],
+            mread_count=row["mread_count"],
+            moa_broad=row["moa-broad"],
+            moa_fine=row["moa-fine"],
+            targets=row["targets"],
+            human_approved=row["human-approved"],
+            clinical_trials=row["clinical-trials"],
+            gpt_notes_approval=row["gpt-notes-approval"],
+        )
+        prompts.append(prompt)
+
     # turn the gene expression into latent space. use this if training the diffusion backbone.
     if not train_vae:
         num_gene = cell_data.shape[1]
-        autoencoder = load_VAE(vae_path,num_gene,hidden_dim)
-        cell_data = autoencoder(torch.tensor(cell_data).cuda(),return_latent=True)
+        autoencoder = load_VAE(vae_path, num_gene, hidden_dim)
+        cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
         cell_data = cell_data.cpu().detach().numpy()
     
     dataset = CellDataset(
         cell_data,
-        classes
+        classes,
+        prompts,
+        smiles,
     )
     if deterministic:
         loader = DataLoader(
@@ -108,12 +144,16 @@ class CellDataset(Dataset):
         self,
         cell_data,
         class_name,
+        prompts=None,
+        smiles=None,
         use_controlnet=False,
         keep_ratio=0.5,
     ):
         super().__init__()
         self.data = cell_data
         self.class_name = class_name
+        self.prompts = prompts
+        self.smiles = smiles
         self.use_controlnet = use_controlnet
         self.keep_ratio = keep_ratio
 
@@ -125,6 +165,10 @@ class CellDataset(Dataset):
         out_dict = {}
         if self.class_name is not None:
             out_dict["y"] = np.array(self.class_name[idx], dtype=np.int64)
+        if self.prompts is not None:
+            out_dict["prompt"] = self.prompts[idx]
+        if self.smiles is not None:
+            out_dict["smiles"] = self.smiles[idx]
         if self.use_controlnet:
             control = np.full_like(arr, -1.0, dtype=np.float32)
             nz = np.where(arr != 0)[0]
