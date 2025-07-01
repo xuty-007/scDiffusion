@@ -1,51 +1,78 @@
+import json
+import os
+
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-import scanpy as sc
-import torch
-import numpy as np
-from sklearn.preprocessing import LabelEncoder
 
-from .cell_datasets_loader import CellDataset, load_VAE
+from .cell_datasets_loader import CellDataset
 
 
 class CellDataModule(pl.LightningDataModule):
-    """Lightning DataModule for cell datasets."""
+    """Lightning DataModule for cell datasets.
 
-    def __init__(self, data_dir, batch_size, vae_path=None, train_vae=False, hidden_dim=128, use_controlnet=False, keep_ratio=0.5):
+    Parameters
+    ----------
+    spec_path : str
+        Path to a JSONL file or directory of JSONL files. Each line contains a
+        JSON object with ``data_path`` pointing to an H5AD file (not a
+        directory), ``n_obs`` or ``num_cell`` giving the number of cells,
+        ``gene_dim`` specifying the number of genes, ``prompt_template`` for
+        building textual prompts, and ``smiles`` naming the column with SMILES
+        strings.
+    batch_size : int
+        Number of samples per batch.
+    use_controlnet : bool, optional
+        Whether to prepare ControlNet inputs.
+    keep_ratio : float, optional
+        Ratio of expression values kept for ControlNet inputs.
+    """
+
+    def __init__(self, spec_path, batch_size, use_controlnet=False, keep_ratio=0.5):
         super().__init__()
-        self.data_dir = data_dir
+        self.spec_path = spec_path
         self.batch_size = batch_size
-        self.vae_path = vae_path
-        self.train_vae = train_vae
-        self.hidden_dim = hidden_dim
         self.use_controlnet = use_controlnet
         self.keep_ratio = keep_ratio
 
     def setup(self, stage=None):
-        adata = sc.read_h5ad(self.data_dir)
-        sc.pp.filter_genes(adata, min_cells=3)
-        sc.pp.filter_cells(adata, min_genes=10)
-        adata.var_names_make_unique()
+        specs = []
+        paths = []
+        if os.path.isdir(self.spec_path):
+            for fname in sorted(os.listdir(self.spec_path)):
+                if fname.endswith(".jsonl"):
+                    paths.append(os.path.join(self.spec_path, fname))
+        else:
+            paths.append(self.spec_path)
 
-        classes = adata.obs["celltype"].values
-        label_encoder = LabelEncoder()
-        labels = classes
-        label_encoder.fit(labels)
-        classes = label_encoder.transform(labels)
+        for p in paths:
+            with open(p, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        specs.append(json.loads(line))
 
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-        cell_data = adata.X.toarray()
+        files = []
+        lengths = []
+        prompt_templates = []
+        smiles_cols = []
+        self.gene_dim = None
 
-        if not self.train_vae:
-            num_gene = cell_data.shape[1]
-            autoencoder = load_VAE(self.vae_path, num_gene, self.hidden_dim)
-            cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
-            cell_data = cell_data.cpu().detach().numpy()
+        for spec in specs:
+            files.append(spec["data_path"])
+            length = spec.get("n_obs")
+            if length is None:
+                length = spec.get("num_cell")
+            lengths.append(length)
+            prompt_templates.append(spec.get("prompt_template"))
+            smiles_cols.append(spec.get("smiles"))
+            if self.gene_dim is None:
+                self.gene_dim = spec.get("gene_dim")
 
         self.dataset = CellDataset(
-            cell_data,
-            classes,
+            files,
+            lengths,
+            prompt_templates=prompt_templates,
+            smiles_cols=smiles_cols,
             use_controlnet=self.use_controlnet,
             keep_ratio=self.keep_ratio,
         )
@@ -58,3 +85,4 @@ class CellDataModule(pl.LightningDataModule):
             num_workers=1,
             drop_last=True,
         )
+
