@@ -3,6 +3,22 @@ import os
 
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
+from torch.utils.data.dataloader import default_collate
+
+
+def _collate_with_optional(batch):
+    """Custom collate that keeps lists for keys with ``None`` values."""
+    arrays, conds = zip(*batch)
+    arrays = default_collate(arrays)
+    cond_batch = {}
+    keys = conds[0].keys()
+    for key in keys:
+        vals = [d[key] for d in conds]
+        if any(v is None for v in vals):
+            cond_batch[key] = list(vals)
+        else:
+            cond_batch[key] = default_collate(vals)
+    return arrays, cond_batch
 
 from .cell_datasets_loader import CellDataset
 
@@ -84,5 +100,6 @@ class CellDataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=1,
             drop_last=True,
+            collate_fn=_collate_with_optional,
         )
 
