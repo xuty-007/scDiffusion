@@ -1,51 +1,97 @@
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
-import scanpy as sc
-import torch
-import numpy as np
-from sklearn.preprocessing import LabelEncoder
+import json
+import os
+from torch.utils.data.dataloader import default_collate
 
-from .cell_datasets_loader import CellDataset, load_VAE
+from .cell_datasets_loader import StreamingCellDataset
+
+import warnings
+from anndata import ImplicitModificationWarning
+
+# 忽略所有 ImplicitModificationWarning
+warnings.filterwarnings('ignore', category=ImplicitModificationWarning)
 
 
 class CellDataModule(pl.LightningDataModule):
-    """Lightning DataModule for cell datasets."""
+    """Lightning DataModule for cell datasets.
 
-    def __init__(self, data_dir, batch_size, vae_path=None, train_vae=False, hidden_dim=128, use_controlnet=False, keep_ratio=0.5):
+    Parameters
+    ----------
+    spec_path : str
+        Path to a JSONL file describing datasets or a directory containing
+        multiple ``.jsonl`` files. Each line in a JSONL file should be a JSON
+        object with ``data_dir`` pointing to the dataset location, ``data_type``
+        of either ``h5ad`` or ``mtx``, ``prompt_template`` for formatting
+        prompts (or ``None`` to skip PubMedBERT), and ``smiles`` containing the
+        column name with SMILES strings (or ``None`` to skip ChemBERT).
+    batch_size : int
+        Number of samples per batch.
+    use_controlnet : bool, optional
+        Whether to prepare ControlNet inputs.
+    keep_ratio : float, optional
+        Ratio of expression values kept for ControlNet inputs.
+    """
+
+    def __init__(self, spec_path, batch_size, file_size=1, num_workers=12, use_controlnet=False, keep_ratio=0.5, path_replace=None):
         super().__init__()
-        self.data_dir = data_dir
+        self.spec_path = spec_path
         self.batch_size = batch_size
-        self.vae_path = vae_path
-        self.train_vae = train_vae
-        self.hidden_dim = hidden_dim
+        self.file_size = file_size
+        self.num_workers = num_workers
         self.use_controlnet = use_controlnet
         self.keep_ratio = keep_ratio
+        if path_replace is None:
+            self.path_replace = ["", ""]
+        else:
+            self.path_replace = path_replace
 
     def setup(self, stage=None):
-        adata = sc.read_h5ad(self.data_dir)
-        sc.pp.filter_genes(adata, min_cells=3)
-        sc.pp.filter_cells(adata, min_genes=10)
-        adata.var_names_make_unique()
+        specs = []
+        paths = []
+        if os.path.isdir(self.spec_path):
+            for fname in sorted(os.listdir(self.spec_path)):
+                if fname.endswith(".jsonl"):
+                    paths.append(os.path.join(self.spec_path, fname))
+        else:
+            paths.append(self.spec_path)
 
-        classes = adata.obs["celltype"].values
-        label_encoder = LabelEncoder()
-        labels = classes
-        label_encoder.fit(labels)
-        classes = label_encoder.transform(labels)
+        for p in paths:
+            with open(p, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        specs.append(json.loads(line))
 
-        sc.pp.normalize_total(adata, target_sum=1e4)
-        sc.pp.log1p(adata)
-        cell_data = adata.X.toarray()
+        files = []
+        lengths = []
+        prompt_templates = []
+        smiles_cols = []
+        self.gene_dim = None
 
-        if not self.train_vae:
-            num_gene = cell_data.shape[1]
-            autoencoder = load_VAE(self.vae_path, num_gene, self.hidden_dim)
-            cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
-            cell_data = cell_data.cpu().detach().numpy()
+        for spec in specs:
+            data_path = spec["data_path"].replace(*self.path_replace)
+            if not os.path.exists(data_path):
+                continue
+            files.append(data_path)
+            length = spec["n_obs"]
+            lengths.append(length)
+            prompt_templates.append(spec.get("prompt_template"))
+            smiles_cols.append(spec.get("smiles"))
+            if self.gene_dim is None:
+                self.gene_dim = spec.get("gene_dim")
 
-        self.dataset = CellDataset(
-            cell_data,
-            classes,
+        self.files_all = files
+        self.lengths_all = lengths
+        self.prompts_all = prompt_templates
+        self.smiles_all = smiles_cols
+
+        self.dataset = StreamingCellDataset(
+            self.files_all,
+            self.lengths_all,
+            prompt_templates=self.prompts_all,
+            smiles_cols=self.smiles_all,
+            file_size=self.file_size,
             use_controlnet=self.use_controlnet,
             keep_ratio=self.keep_ratio,
         )
@@ -54,7 +100,23 @@ class CellDataModule(pl.LightningDataModule):
         return DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=1,
+            shuffle=False,
+            num_workers=self.num_workers,
             drop_last=True,
+            prefetch_factor=2,
+            collate_fn=self._collate_with_optional,
         )
+
+    @staticmethod
+    def _collate_with_optional(batch):
+        arrays, conds = zip(*batch)
+        arrays = default_collate(arrays)
+        cond_batch = {}
+        keys = conds[0].keys()
+        for key in keys:
+            vals = [d[key] for d in conds]
+            if any(v is None for v in vals):
+                cond_batch[key] = list(vals)
+            else:
+                cond_batch[key] = default_collate(vals)
+        return arrays, cond_batch

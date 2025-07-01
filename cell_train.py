@@ -52,13 +52,15 @@ def main():
         weight_decay=args.weight_decay,
         schedule_sampler=schedule_sampler,
         lr_anneal_steps=args.lr_anneal_steps,
+        vae_path=args.vae_path,
+        train_vae=False,
+        hidden_dim=128,
     )
 
     data_module = CellDataModule(
-        data_dir=args.data_dir,
+        spec_path=args.data_jsonl,
         batch_size=args.batch_size,
-        vae_path=args.vae_path,
-        train_vae=False,
+        file_size=args.file_size,
         use_controlnet=args.use_controlnet,
         keep_ratio=args.keep_ratio,
     )
@@ -96,18 +98,20 @@ def main():
         ],
         accelerator="auto",
         devices=1,
+        reload_dataloaders_every_n_epochs=1,
     )
     trainer.fit(lit_model, datamodule=data_module)
 
 
 def create_argparser():
     defaults = dict(
-        data_dir="/data1/lep/Workspace/guided-diffusion/data/tabula_muris/all.h5ad",
+        data_jsonl="/path/to/spec.jsonl",
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0001,
         lr_anneal_steps=500000,
         batch_size=128,
+        file_size=1,
         microbatch=-1,
         ema_rate="0.9999",
         log_interval=100,

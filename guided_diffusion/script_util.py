@@ -32,7 +32,8 @@ def model_and_diffusion_defaults():
     res = dict(
         input_dim = 128,
         hidden_dim = [512,512,256,128],
-        dropout = 0.0
+        dropout = 0.0,
+        cond_dim = 768
     )
     res.update(diffusion_defaults())
     return res
@@ -63,11 +64,13 @@ def create_model_and_diffusion(
     rescale_timesteps,
     rescale_learned_sigmas,
     dropout,
+    cond_dim,
 ):
     model = create_model(
         input_dim,
         hidden_dim,
-        dropout=dropout
+        dropout=dropout,
+        cond_dim=cond_dim,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -86,12 +89,14 @@ def create_model(
     input_dim,
     hidden_dim,
     dropout,
+    cond_dim=0,
 ):
 
     return Cell_Unet(
         input_dim,
         hidden_dim,
-        dropout=dropout
+        dropout=dropout,
+        cond_dim=cond_dim
     )
 
 
@@ -100,8 +105,9 @@ def create_controlled_model(
     input_dim,
     hidden_dim,
     dropout,
+    cond_dim=0,
 ):
-    return ControlledCellUnet(input_dim, hidden_dim, dropout)
+    return ControlledCellUnet(input_dim, hidden_dim, dropout, cond_dim)
 
 def create_controlled_model_and_diffusion(
     input_dim,
@@ -116,11 +122,13 @@ def create_controlled_model_and_diffusion(
     rescale_timesteps,
     rescale_learned_sigmas,
     dropout,
+    cond_dim,
 ):
     model = create_controlled_model(
         input_dim,
         hidden_dim,
-        dropout
+        dropout,
+        cond_dim,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
