@@ -52,13 +52,14 @@ def main():
         weight_decay=args.weight_decay,
         schedule_sampler=schedule_sampler,
         lr_anneal_steps=args.lr_anneal_steps,
+        vae_path=args.vae_path,
+        train_vae=False,
+        hidden_dim=128,
     )
 
     data_module = CellDataModule(
-        data_dir=args.data_dir,
+        spec_path=args.data_jsonl,
         batch_size=args.batch_size,
-        vae_path=args.vae_path,
-        train_vae=False,
         use_controlnet=args.use_controlnet,
         keep_ratio=args.keep_ratio,
     )
@@ -102,7 +103,7 @@ def main():
 
 def create_argparser():
     defaults = dict(
-        data_dir="/data1/lep/Workspace/guided-diffusion/data/tabula_muris/all.h5ad",
+        data_jsonl="/path/to/spec.jsonl",
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0001,
