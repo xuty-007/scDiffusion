@@ -1,17 +1,16 @@
-import math
 import random
 
-from PIL import Image
-import blobfile as bf
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 import pandas as pd
 import glob
 import os
 from functools import lru_cache
+import json
 
 import scanpy as sc
 import torch
+import torch.distributed as dist
 import sys
 sys.path.append('..')
 from VAE.VAE_model import VAE
@@ -62,23 +61,77 @@ def load_VAE(vae_path, num_gene, hidden_dim):
 
 def load_data(
     *,
-    data_dir,
+    data_dir=None,
+    data_jsonl=None,
     batch_size,
     vae_path=None,
     deterministic=False,
-    train_vae=False,
     hidden_dim=128,
+    file_size=1,
 ):
     """
     For a dataset, create a generator over (cells, kwargs) pairs.
 
-    :param data_dir: a dataset directory.
+    :param data_dir: a dataset directory (legacy).
+    :param data_jsonl: JSONL specification of datasets.
     :param batch_size: the batch size of each returned pair.
     :param vae_path: the path to save autoencoder / read autoencoder checkpoint.
     :param deterministic: if True, yield results in a deterministic order.
-    :param train_vae: train the autoencoder or use the autoencoder.
     :param hidden_dim: the dimensions of latent space. If use pretrained weight, set 128
     """
+
+    if data_jsonl is not None:
+        specs = []
+        paths = []
+        if os.path.isdir(data_jsonl):
+            for fname in sorted(os.listdir(data_jsonl)):
+                if fname.endswith(".jsonl"):
+                    paths.append(os.path.join(data_jsonl, fname))
+        else:
+            paths = [p.strip() for p in str(data_jsonl).split(',') if p.strip()]
+
+        for path_idx, p in enumerate(paths):
+            with open(p, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        specs.append((json.loads(line), path_idx))
+
+        files = []
+        lengths = []
+        ds_ids = []
+        for spec, path_idx in specs:
+            dp = spec["data_path"]
+            if not os.path.exists(dp):
+                continue
+            files.append(dp)
+            lengths.append(spec["n_obs"])
+            ds_ids.append(path_idx)
+
+        from collections import Counter
+        ds_counts = {k: v for k, v in Counter(ds_ids).items()}
+
+        dataset = StreamingCellDataset(
+            files,
+            lengths,
+            prompt_templates=[None] * len(files),
+            smiles_cols=[None] * len(files),
+            ds_ids=ds_ids,
+            ds_counts=ds_counts,
+            file_size=file_size,
+            use_controlnet=False,
+        )
+
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=not deterministic,
+            num_workers=1,
+            drop_last=True,
+        )
+        while True:
+            yield from loader
+
     if not data_dir:
         raise ValueError("unspecified data directory")
 
@@ -153,12 +206,11 @@ def load_data(
         )
         prompts.append(prompt)
 
-    # turn the gene expression into latent space. use this if training the diffusion backbone.
-    if not train_vae:
-        num_gene = cell_data.shape[1]
-        autoencoder = load_VAE(vae_path, num_gene, hidden_dim)
-        cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
-        cell_data = cell_data.cpu().detach().numpy()
+    # convert the gene expression to latent space
+    num_gene = cell_data.shape[1]
+    autoencoder = load_VAE(vae_path, num_gene, hidden_dim)
+    cell_data = autoencoder(torch.tensor(cell_data).cuda(), return_latent=True)
+    cell_data = cell_data.cpu().detach().numpy()
     
     dataset = CellDataset(
         cell_data,
@@ -185,8 +237,10 @@ class CellDataset(Dataset):
         lengths,
         prompt_templates=None,
         smiles_cols=None,
+        ds_ids=None,
         use_controlnet=False,
-        keep_ratio=0.5,
+        keep_nz_ratio=0.5,
+        keep_z_ratio=0.0,
     ):
         """Dataset that lazily reads rows from one or more H5AD files.
 
@@ -196,12 +250,14 @@ class CellDataset(Dataset):
             Paths to backed ``.h5ad`` files.
         lengths : list[int]
             Number of cells in each file.
-        prompt_templates : list[str] or None
-            Prompt format strings corresponding to ``files``. ``None`` disables
-            prompt generation for that file.
+        prompt_templates : list[str | list[str]] or None
+            Prompt format strings or lists of templates corresponding to
+            ``files``. ``None`` disables prompt generation for that file.
         smiles_cols : list[str] or None
             Column names for SMILES strings. ``None`` disables ChemBERT
             conditioning for that file.
+        ds_ids : list[int] or None
+            Integer dataset identifiers for ``files``. ``None`` defaults to 0 for all.
         """
 
         super().__init__()
@@ -217,8 +273,17 @@ class CellDataset(Dataset):
         assert len(smiles_cols) == len(files)
         self.prompt_templates = list(prompt_templates)
         self.smiles_cols = list(smiles_cols)
+        if ds_ids is None:
+            ds_ids = [0] * len(files)
+        assert len(ds_ids) == len(files)
+        self.ds_ids = list(ds_ids)
+        if ds_ids is None:
+            ds_ids = [0] * len(files)
+        assert len(ds_ids) == len(files)
+        self.ds_ids = list(ds_ids)
         self.use_controlnet = use_controlnet
-        self.keep_ratio = keep_ratio
+        self.keep_nz_ratio = keep_nz_ratio
+        self.keep_z_ratio = keep_z_ratio
 
     def __len__(self):
         return self.total_len
@@ -252,7 +317,11 @@ class CellDataset(Dataset):
         out_dict["smiles"] = canonical
 
         # prompt construction
-        template = self.prompt_templates[file_idx]
+        tmpl_spec = self.prompt_templates[file_idx]
+        if isinstance(tmpl_spec, list):
+            template = random.choice(tmpl_spec) if len(tmpl_spec) > 0 else None
+        else:
+            template = tmpl_spec
         if template is not None:
             row_dict = row.obs.iloc[0].to_dict()
             canonical_prompt = canonical if canonical is not None else "None"
@@ -264,16 +333,22 @@ class CellDataset(Dataset):
             prompt = None
         out_dict["prompt"] = prompt
 
+        ds_id = self.ds_ids[file_idx]
         if self.use_controlnet:
-            control = np.zeros_like(arr, dtype=np.float32)
+            control = np.full_like(arr, -10.0, dtype=np.float32)
             nz = np.where(arr != 0)[0]
             if len(nz) > 0:
-                mask = np.random.rand(len(nz)) < self.keep_ratio
+                mask = np.random.rand(len(nz)) < self.keep_nz_ratio
                 keep_idx = nz[mask]
+                control[keep_idx] = arr[keep_idx]
+            z = np.where(arr == 0)[0]
+            if len(z) > 0 and self.keep_z_ratio > 0:
+                mask = np.random.rand(len(z)) < self.keep_z_ratio
+                keep_idx = z[mask]
                 control[keep_idx] = arr[keep_idx]
             out_dict["control"] = control
 
-        return arr, out_dict
+        return arr, out_dict, ds_id
 
 
 class MemoryCellDataset(Dataset):
@@ -284,8 +359,10 @@ class MemoryCellDataset(Dataset):
         files,
         prompt_templates=None,
         smiles_cols=None,
+        ds_ids=None,
         use_controlnet=False,
-        keep_ratio=0.5,
+        keep_nz_ratio=0.5,
+        keep_z_ratio=0.0,
     ):
         super().__init__()
         if prompt_templates is None:
@@ -296,10 +373,14 @@ class MemoryCellDataset(Dataset):
         assert len(smiles_cols) == len(files)
 
         self.files = list(files)
+        if ds_ids is None:
+            ds_ids = [0] * len(files)
+        assert len(ds_ids) == len(files)
         arrays = []
         prompts = []
         smiles = []
-        for path, tmpl, col in zip(files, prompt_templates, smiles_cols):
+        ds_all = []
+        for path, tmpl, col, ds in zip(files, prompt_templates, smiles_cols, ds_ids):
             adata = sc.read_h5ad(path)
             sc.pp.normalize_total(adata, target_sum=1e4)
             sc.pp.log1p(adata)
@@ -309,6 +390,7 @@ class MemoryCellDataset(Dataset):
             else:
                 arr = np.array(arr, dtype=np.float32)
             arrays.append(arr)
+            ds_all.append(np.full(arr.shape[0], ds, dtype=np.int64))
             for _, row in adata.obs.iterrows():
                 canonical = None
                 if col and col in row.index:
@@ -316,7 +398,11 @@ class MemoryCellDataset(Dataset):
                     if pd.isna(canonical):
                         canonical = None
                 smiles.append(canonical)
-                if tmpl is not None:
+                if isinstance(tmpl, list):
+                    template = random.choice(tmpl) if len(tmpl) > 0 else None
+                else:
+                    template = tmpl
+                if template is not None:
                     row_dict = row.to_dict()
                     cp = canonical if canonical is not None else "None"
                     row_dict.setdefault("canonical_smiles", cp)
@@ -324,7 +410,7 @@ class MemoryCellDataset(Dataset):
                         row_dict["drug_concentration_with_unit"] = str(
                             row_dict["drug_concentration_with_unit"]
                         ).replace(" ", "")
-                    prompt = tmpl.format(**row_dict)
+                    prompt = template.format(**row_dict)
                 else:
                     prompt = None
                 prompts.append(prompt)
@@ -332,8 +418,10 @@ class MemoryCellDataset(Dataset):
         self.arrays = np.concatenate(arrays, axis=0) if len(arrays) > 1 else arrays[0]
         self.prompts = prompts
         self.smiles = smiles
+        self.ds_ids = np.concatenate(ds_all) if len(ds_all) > 1 else ds_all[0]
         self.use_controlnet = use_controlnet
-        self.keep_ratio = keep_ratio
+        self.keep_nz_ratio = keep_nz_ratio
+        self.keep_z_ratio = keep_z_ratio
 
     def __len__(self):
         return self.arrays.shape[0]
@@ -345,18 +433,25 @@ class MemoryCellDataset(Dataset):
             "smiles": self.smiles[idx],
         }
         if self.use_controlnet:
-            control = np.zeros_like(arr, dtype=np.float32)
+            control = np.full_like(arr, -10.0, dtype=np.float32)
             nz = np.where(arr != 0)[0]
             if len(nz) > 0:
-                mask = np.random.rand(len(nz)) < self.keep_ratio
+                mask = np.random.rand(len(nz)) < self.keep_nz_ratio
                 keep_idx = nz[mask]
                 control[keep_idx] = arr[keep_idx]
+            z = np.where(arr == 0)[0]
+            if len(z) > 0 and self.keep_z_ratio > 0:
+                mask = np.random.rand(len(z)) < self.keep_z_ratio
+                keep_idx = z[mask]
+                control[keep_idx] = arr[keep_idx]
             out["control"] = control
-        return arr, out
+        ds_id = int(self.ds_ids[idx]) if hasattr(self, "ds_ids") else 0
+        return arr, out, ds_id
 
 
 class StreamingCellDataset(IterableDataset):
-    """Stream ``file_size`` H5AD files at a time until all are exhausted."""
+    """Stream ``file_size`` H5AD files at a time with support for DataLoader
+    workers and distributed training."""
 
     def __init__(
         self,
@@ -364,9 +459,12 @@ class StreamingCellDataset(IterableDataset):
         lengths,
         prompt_templates=None,
         smiles_cols=None,
+        ds_ids=None,
+        ds_counts=None,
         file_size=1,
         use_controlnet=False,
-        keep_ratio=0.5,
+        keep_nz_ratio=0.5,
+        keep_z_ratio=0.0,
     ):
         super().__init__()
         if prompt_templates is None:
@@ -380,71 +478,137 @@ class StreamingCellDataset(IterableDataset):
         self.lengths = list(lengths)
         self.prompt_templates = list(prompt_templates)
         self.smiles_cols = list(smiles_cols)
+        if ds_ids is None:
+            ds_ids = [0] * len(files)
+        assert len(ds_ids) == len(files)
+        self.ds_ids = list(ds_ids)
+        self.ds_counts = ds_counts if ds_counts is not None else {}
         self.file_size = file_size
         self.use_controlnet = use_controlnet
-        self.keep_ratio = keep_ratio
+        self.keep_nz_ratio = keep_nz_ratio
+        self.keep_z_ratio = keep_z_ratio
 
     def __len__(self):
         return sum(self.lengths)
 
-    def _iter_file(self, file_idx):
-        path = self.files[file_idx]
-        length = self.lengths[file_idx]
-        tmpl = self.prompt_templates[file_idx]
-        col = self.smiles_cols[file_idx]
-        adata = read_h5ad_backed(path)
-        order = np.random.permutation(length)
-        for local_idx in order:
-            row = adata[int(local_idx)]
-            arr = row.X
-            if hasattr(arr, "toarray"):
-                arr = arr.toarray().ravel().astype(np.float32)
-            else:
-                arr = np.array(arr, dtype=np.float32)
-
-            out = {}
-            canonical = None
-            if col and col in row.obs.columns:
-                canonical = row.obs[col].values[0]
-                if pd.isna(canonical):
-                    canonical = None
-            out["smiles"] = canonical
-
-            if tmpl is not None:
-                row_dict = row.obs.iloc[0].to_dict()
-                cp = canonical if canonical is not None else "None"
-                row_dict.setdefault("canonical_smiles", cp)
-                if "drug_concentration_with_unit" in row_dict:
-                    row_dict["drug_concentration_with_unit"] = str(
-                        row_dict["drug_concentration_with_unit"]
-                    ).replace(" ", "")
-                prompt = tmpl.format(**row_dict)
-            else:
-                prompt = None
-            out["prompt"] = prompt
-
-            if self.use_controlnet:
-                control = np.zeros_like(arr, dtype=np.float32)
-                nz = np.where(arr != 0)[0]
-                if len(nz) > 0:
-                    mask = np.random.rand(len(nz)) < self.keep_ratio
-                    keep_idx = nz[mask]
-                    control[keep_idx] = arr[keep_idx]
-                out["control"] = control
-
-            yield arr, out
-
     def __iter__(self):
-        order = np.random.permutation(len(self.files))
-        for start in range(0, len(order), self.file_size):
-            subset = order[start : start + self.file_size]
+        worker = torch.utils.data.get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
+
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+
+        num_shards = num_workers * world_size
+        shard = rank * num_workers + worker_id
+
+        if self.ds_counts and len(self.ds_counts) > 1:
+            weights = np.array([1.0 / self.ds_counts.get(ds, 1) for ds in self.ds_ids])
+            prob = weights / weights.sum()
+            order = np.random.choice(len(self.files), size=len(self.files), replace=True, p=prob)
+        else:
+            order = np.random.permutation(len(self.files))
+
+        pad = (-len(order)) % (self.file_size * num_shards)
+        if pad > 0:
+            order = np.concatenate([order, order[:pad]])
+
+        order = order[shard::num_shards]
+
+        files = [self.files[i] for i in order]
+        prompts = [self.prompt_templates[i] for i in order]
+        smiles_cols = [self.smiles_cols[i] for i in order]
+        ds_ids = [self.ds_ids[i] for i in order]
+
+        for start in range(0, len(files), self.file_size):
+            subset_files = files[start : start + self.file_size]
             mem_ds = MemoryCellDataset(
-                [self.files[i] for i in subset],
-                prompt_templates=[self.prompt_templates[i] for i in subset],
-                smiles_cols=[self.smiles_cols[i] for i in subset],
+                subset_files,
+                prompt_templates=prompts[start : start + self.file_size],
+                smiles_cols=smiles_cols[start : start + self.file_size],
+                ds_ids=ds_ids[start : start + self.file_size],
                 use_controlnet=self.use_controlnet,
-                keep_ratio=self.keep_ratio,
+                keep_nz_ratio=self.keep_nz_ratio,
+                keep_z_ratio=self.keep_z_ratio,
             )
             for idx in range(len(mem_ds)):
                 yield mem_ds[idx]
+
+
+class _StreamingCellIterator:
+    def __init__(self, files, prompt_templates, smiles_cols, ds_ids, file_size, use_controlnet, keep_nz_ratio, keep_z_ratio):
+        self.files = list(files)
+        self.prompt_templates = list(prompt_templates)
+        self.smiles_cols = list(smiles_cols)
+        self.ds_ids = list(ds_ids)
+        self.file_size = file_size
+        self.use_controlnet = use_controlnet
+        self.keep_nz_ratio = keep_nz_ratio
+        self.keep_z_ratio = keep_z_ratio
+
+        self.rng = np.random.default_rng()
+        self.file_order = np.arange(len(self.files))
+        self.file_order_idx = 0
+
+        self.chunk_buffers = []
+        self.chunk_block_idxs = []
+        self.chunk_block_order = []
+        self.curr_idx = 0
+
+        if len(self.file_order) == 0:
+            raise ValueError("No input files for StreamingCellDataset")
+
+        self._load_n_chunks()
+
+    def _load_chunk(self, idx):
+        ds = MemoryCellDataset(
+            [self.files[idx]],
+            prompt_templates=[self.prompt_templates[idx]],
+            smiles_cols=[self.smiles_cols[idx]],
+            ds_ids=[self.ds_ids[idx]],
+            use_controlnet=self.use_controlnet,
+            keep_nz_ratio=self.keep_nz_ratio,
+            keep_z_ratio=self.keep_z_ratio,
+        )
+        return ds, len(ds)
+
+    def _load_n_chunks(self):
+        if self.file_order_idx >= len(self.file_order):
+            self.file_order = self.rng.permutation(len(self.files))
+            self.file_order_idx = 0
+
+        self.chunk_buffers = []
+        self.chunk_block_idxs = []
+
+        remaining = len(self.file_order) - self.file_order_idx
+        if remaining < self.file_size:
+            self.file_order = self.rng.permutation(len(self.files))
+            self.file_order_idx = 0
+
+        for i in range(self.file_size):
+            idx = self.file_order[self.file_order_idx]
+            self.file_order_idx += 1
+            chunk, n_blocks = self._load_chunk(idx)
+            self.chunk_buffers.append(chunk)
+            self.chunk_block_idxs.extend([(i, j) for j in range(n_blocks)])
+
+        order = self.rng.permutation(len(self.chunk_block_idxs))
+        self.chunk_block_order = order.tolist()
+        self.curr_idx = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.curr_idx >= len(self.chunk_block_order):
+            self._load_n_chunks()
+        order_idx = self.chunk_block_order[self.curr_idx]
+        chunk_id, sample_id = self.chunk_block_idxs[order_idx]
+        sample = self.chunk_buffers[chunk_id][sample_id]
+        self.curr_idx += 1
+        return sample
 
