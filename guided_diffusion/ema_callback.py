@@ -23,7 +23,13 @@ class EMACallback(pl.Callback):
 
     def on_load_checkpoint(self, trainer, pl_module, checkpoint):
         ema_state = checkpoint.get("ema_state_dict")
-        if ema_state:
-            for p, cp in zip(self.ema_params, ema_state):
-                p.copy_(cp)
+        if not ema_state:
+            return
+        # lazily create EMA params in case on_train_start hasn't run yet
+        if self.ema_params is None:
+            self.ema_params = [p.clone().detach() for p in pl_module.model.parameters()]
+            for p in self.ema_params:
+                p.requires_grad = False
+        for p, cp in zip(self.ema_params, ema_state):
+            p.copy_(cp)
 
